@@ -67,6 +67,15 @@ Notes:
 - OAuth whoami (debug): `https://YOUR_PUBLIC_BASE_URL/oauth/whoami` (returns no tokens)
 - OAuth debug (redirect/client id): `https://YOUR_PUBLIC_BASE_URL/debug/oauth`
 
+## Manual sheet export trigger
+
+If you want to push current totals (baseline + collected segments) to Google Sheets without waiting for `stream.offline`,
+call:
+
+- `POST https://YOUR_PUBLIC_BASE_URL/admin/export-now`
+
+This endpoint requires `ADMIN_API_KEY` (send header `X-Admin-Key`).
+
 ### Optional hardening
 
 - Set `ADMIN_API_KEY` to protect debug endpoints (send header `X-Admin-Key`).

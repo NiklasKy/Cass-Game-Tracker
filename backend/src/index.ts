@@ -54,6 +54,17 @@ function getRedirectUri(env: ReturnType<typeof getEnv>): string {
   return env.TWITCH_REDIRECT_URI ?? `${env.PUBLIC_BASE_URL.replace(/\/$/, '')}/oauth/callback`;
 }
 
+async function exportTotalsToSheet(pool: ReturnType<typeof createPool>, env: ReturnType<typeof getEnv>) {
+  const aggregates = await getGlobalGameTotals(pool);
+  await upsertGamesToSheet({
+    sheetId: env.GOOGLE_SHEET_ID,
+    tabName: env.GOOGLE_SHEET_TAB_NAME,
+    serviceAccountJson: env.GOOGLE_SERVICE_ACCOUNT_JSON,
+    aggregates
+  });
+  return { games: aggregates.length };
+}
+
 async function main() {
   const env = getEnv();
   const pool = createPool();
@@ -181,6 +192,13 @@ async function main() {
           effectiveRedirectUri: getRedirectUri(env),
           note: 'Register effectiveRedirectUri exactly in the Twitch Developer Console.'
         });
+      }
+
+      if (url.pathname === '/admin/export-now') {
+        if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'Method Not Allowed' });
+        if (!requireAdmin(env, req)) return json(res, 403, { ok: false, error: 'Forbidden' });
+        const result = await exportTotalsToSheet(pool, env);
+        return json(res, 200, { ok: true, ...result });
       }
 
       return text(res, 404, 'Not Found');
@@ -346,13 +364,7 @@ async function handleNotification(
     console.log('[segments] stream offline', streamId);
 
     // Write global totals: baseline + all collected segments
-    const aggregates = await getGlobalGameTotals(pool);
-    await upsertGamesToSheet({
-      sheetId: env.GOOGLE_SHEET_ID,
-      tabName: env.GOOGLE_SHEET_TAB_NAME,
-      serviceAccountJson: env.GOOGLE_SERVICE_ACCOUNT_JSON,
-      aggregates
-    });
+    await exportTotalsToSheet(pool, env);
     console.log('[sheets] updated from stream', streamId);
     return;
   }
