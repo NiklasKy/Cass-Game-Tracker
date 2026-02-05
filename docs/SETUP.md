@@ -81,6 +81,15 @@ INSERT INTO baseline_games (source, game_name, total_hours, last_seen_date, note
 VALUES ('twitchtracker_manual', 'ELDEN RING', 103, '2026-02-01', 'Copied from TwitchTracker table');
 ```
 
+## How baseline is used
+
+When a stream ends (`stream.offline`), the collector updates the Google Sheet using:
+
+- latest baseline snapshot per game from `baseline_games` (most recent `inserted_at` wins)
+- plus all collected durations from `category_segments`
+
+This makes the sheet show all-time totals even after the collector restarts.
+
 ## Notes
 
 On EventSub notifications the collector will:

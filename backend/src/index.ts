@@ -19,6 +19,7 @@ import {
   closeOpenSegment,
   getActiveStream,
   getAggregatesForStream,
+  getGlobalGameTotals,
   markStreamOffline,
   rotateSegment,
   startSegment,
@@ -344,7 +345,8 @@ async function handleNotification(
     await markStreamOffline(pool, streamId, ts, 'offline_event');
     console.log('[segments] stream offline', streamId);
 
-    const aggregates = await getAggregatesForStream(pool, streamId);
+    // Write global totals: baseline + all collected segments
+    const aggregates = await getGlobalGameTotals(pool);
     await upsertGamesToSheet({
       sheetId: env.GOOGLE_SHEET_ID,
       tabName: env.GOOGLE_SHEET_TAB_NAME,

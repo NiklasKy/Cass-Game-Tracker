@@ -98,3 +98,57 @@ export async function getAggregatesForStream(pool: Pool, streamId: string) {
   }));
 }
 
+/**
+ * Returns global totals per game: baseline (latest per game) + all recorded segments.
+ *
+ * baseline_games is treated as a "status quo snapshot" (latest row per game wins).
+ * category_segments are summed across all finalized segments.
+ */
+export async function getGlobalGameTotals(pool: Pool) {
+  const r = await pool.query(
+    `
+    WITH baseline AS (
+      SELECT DISTINCT ON (lower(game_name))
+        lower(game_name) AS k,
+        game_name,
+        COALESCE(total_hours, 0) AS total_hours,
+        last_seen_date
+      FROM baseline_games
+      ORDER BY lower(game_name), inserted_at DESC
+    ),
+    seg AS (
+      SELECT
+        lower(category_name) AS k,
+        category_name,
+        MAX(ended_at) AS last_seen,
+        SUM(duration_seconds)::bigint AS total_seconds
+      FROM category_segments
+      WHERE duration_seconds IS NOT NULL
+      GROUP BY lower(category_name), category_name
+    ),
+    merged AS (
+      SELECT
+        COALESCE(seg.k, baseline.k) AS k,
+        COALESCE(seg.category_name, baseline.game_name) AS game,
+        (COALESCE(seg.total_seconds, 0)::bigint + (COALESCE(baseline.total_hours, 0) * 3600)::bigint) AS total_seconds,
+        GREATEST(
+          COALESCE(seg.last_seen, '1970-01-01'::timestamptz),
+          COALESCE(baseline.last_seen_date::timestamptz, '1970-01-01'::timestamptz)
+        ) AS last_seen
+      FROM seg
+      FULL OUTER JOIN baseline ON seg.k = baseline.k
+    )
+    SELECT game, total_seconds, last_seen
+    FROM merged
+    WHERE game IS NOT NULL
+    ORDER BY total_seconds DESC, game ASC
+    `
+  );
+
+  return r.rows.map((row) => ({
+    game: String(row.game),
+    durationSeconds: Number(row.total_seconds ?? 0),
+    lastStreamDate: row.last_seen ? new Date(row.last_seen) : new Date(0)
+  }));
+}
+
