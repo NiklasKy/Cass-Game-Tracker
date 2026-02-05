@@ -19,7 +19,24 @@ const EnvSchema = z.object({
 
 export type Env = z.infer<typeof EnvSchema>;
 
+function stripWrappingQuotes(value: string): string {
+  const v = value.trim();
+  if (v.length >= 2) {
+    const first = v[0];
+    const last = v[v.length - 1];
+    if ((first === `"` && last === `"`) || (first === `'` && last === `'`)) {
+      return v.slice(1, -1);
+    }
+  }
+  return v;
+}
+
 export function getEnv(): Env {
-  return EnvSchema.parse(process.env);
+  const cleaned: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (typeof v !== 'string') continue;
+    cleaned[k] = stripWrappingQuotes(v);
+  }
+  return EnvSchema.parse(cleaned);
 }
 
