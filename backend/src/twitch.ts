@@ -1,4 +1,5 @@
 import type { Pool } from 'pg';
+import { decryptIfConfigured, encryptIfConfigured } from './crypto.js';
 
 const HELIX_BASE = 'https://api.twitch.tv/helix';
 
@@ -60,14 +61,20 @@ export async function getUserAccessToken(pool: Pool, clientId: string, clientSec
   );
   if (!r.rowCount) throw new Error('No Twitch user token found. Complete /oauth/start once.');
   const row = r.rows[0];
+  const encKey = process.env.TOKEN_ENCRYPTION_KEY;
+  const accessToken = decryptIfConfigured(row.access_token, encKey);
+  const refreshToken = decryptIfConfigured(row.refresh_token, encKey);
   const expiresAt = new Date(row.expires_at).getTime();
   const now = Date.now();
 
-  if (expiresAt - 120_000 > now) return row.access_token;
+  if (expiresAt - 120_000 > now) return accessToken;
 
-  const refreshed = await refreshUserToken(clientId, clientSecret, row.refresh_token);
+  const refreshed = await refreshUserToken(clientId, clientSecret, refreshToken);
   const newExpiresAt = new Date(Date.now() + refreshed.expires_in * 1000);
   const scope = Array.isArray(refreshed.scope) ? refreshed.scope.join(' ') : String(refreshed.scope ?? row.scope ?? '');
+
+  const nextAccess = encryptIfConfigured(refreshed.access_token, encKey);
+  const nextRefresh = encryptIfConfigured(refreshed.refresh_token, encKey);
 
   await pool.query(
     `
@@ -79,10 +86,63 @@ export async function getUserAccessToken(pool: Pool, clientId: string, clientSec
       updated_at=NOW()
     WHERE provider='twitch' AND subject=$5
     `,
-    [refreshed.access_token, refreshed.refresh_token, scope, newExpiresAt, row.subject]
+    [nextAccess, nextRefresh, scope, newExpiresAt, row.subject]
   );
 
   return refreshed.access_token;
+}
+
+export async function getLastAuthorizedUser(pool: Pool, clientId: string, clientSecret: string) {
+  const r = await pool.query<OAuthTokenRow>(
+    `SELECT subject, access_token, refresh_token, expires_at, scope
+     FROM oauth_tokens WHERE provider='twitch'
+     ORDER BY updated_at DESC LIMIT 1`
+  );
+  if (!r.rowCount) return null;
+
+  const row = r.rows[0];
+  const encKey = process.env.TOKEN_ENCRYPTION_KEY;
+  const accessToken = decryptIfConfigured(row.access_token, encKey);
+
+  const userResp = await fetch('https://api.twitch.tv/helix/users', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Client-Id': clientId
+    }
+  });
+  if (!userResp.ok) {
+    // Attempt refresh once if the token got invalidated
+    await getUserAccessToken(pool, clientId, clientSecret);
+    const r2 = await pool.query<OAuthTokenRow>(
+      `SELECT subject, access_token, expires_at, scope FROM oauth_tokens WHERE provider='twitch' ORDER BY updated_at DESC LIMIT 1`
+    );
+    if (!r2.rowCount) return null;
+    const row2 = r2.rows[0];
+    const access2 = decryptIfConfigured(row2.access_token, encKey);
+    const userResp2 = await fetch('https://api.twitch.tv/helix/users', {
+      headers: { Authorization: `Bearer ${access2}`, 'Client-Id': clientId }
+    });
+    if (!userResp2.ok) return { subject: row2.subject, login: null, displayName: null, scope: row2.scope, expiresAt: row2.expires_at };
+    const userJson2: any = await userResp2.json();
+    const u2 = userJson2?.data?.[0];
+    return {
+      subject: row2.subject,
+      login: u2?.login ?? null,
+      displayName: u2?.display_name ?? null,
+      scope: row2.scope,
+      expiresAt: row2.expires_at
+    };
+  }
+
+  const userJson: any = await userResp.json();
+  const u = userJson?.data?.[0];
+  return {
+    subject: row.subject,
+    login: u?.login ?? null,
+    displayName: u?.display_name ?? null,
+    scope: row.scope,
+    expiresAt: row.expires_at
+  };
 }
 
 async function refreshUserToken(clientId: string, clientSecret: string, refreshToken: string) {

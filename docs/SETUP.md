@@ -21,7 +21,9 @@ The collector must only update columns **A-C**.
 Create an app in the Twitch Developer Console.
 
 - Client type: **Confidential**
-- OAuth Redirect URL: `https://YOUR_PUBLIC_BASE_URL/oauth/callback`
+- OAuth Redirect URL: `https://YOUR_PUBLIC_BASE_URL/oauth/callback` (must match exactly)
+
+If you run multiple environments, you can set `TWITCH_REDIRECT_URI` to force an exact redirect URI.
 
 ## 3) Google Service Account
 
@@ -62,6 +64,13 @@ Notes:
 
 - Health check: `https://YOUR_PUBLIC_BASE_URL/healthz`
 - Debug state: `https://YOUR_PUBLIC_BASE_URL/debug/state`
+- OAuth whoami (debug): `https://YOUR_PUBLIC_BASE_URL/oauth/whoami` (returns no tokens)
+- OAuth debug (redirect/client id): `https://YOUR_PUBLIC_BASE_URL/debug/oauth`
+
+### Optional hardening
+
+- Set `ADMIN_API_KEY` to protect debug endpoints (send header `X-Admin-Key`).
+- Set `TOKEN_ENCRYPTION_KEY` (base64 32 bytes) to encrypt OAuth tokens at rest in Postgres.
 
 ## Manual baseline (status quo)
 

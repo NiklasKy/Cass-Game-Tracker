@@ -11,10 +11,15 @@ const EnvSchema = z.object({
   TWITCH_CLIENT_SECRET: z.string().min(1),
   TWITCH_BROADCASTER_LOGIN: z.string().min(1),
   PUBLIC_BASE_URL: z.string().url().min(1),
+  TWITCH_REDIRECT_URI: z.string().url().optional(),
 
   GOOGLE_SHEET_ID: z.string().min(1),
   GOOGLE_SERVICE_ACCOUNT_JSON: z.string().min(1),
-  GOOGLE_SHEET_TAB_NAME: z.string().min(1).default('Games')
+  GOOGLE_SHEET_TAB_NAME: z.string().min(1).default('Games'),
+
+  // Optional hardening
+  ADMIN_API_KEY: z.string().min(1).optional(),
+  TOKEN_ENCRYPTION_KEY: z.string().min(1).optional()
 });
 
 export type Env = z.infer<typeof EnvSchema>;

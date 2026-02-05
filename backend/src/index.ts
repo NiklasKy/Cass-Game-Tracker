@@ -4,11 +4,13 @@ import { WebSocket } from 'ws';
 import { createPool } from './db.js';
 import { getEnv } from './env.js';
 import { applyMigrations } from './migrations.js';
+import { encryptIfConfigured } from './crypto.js';
 import {
   createEventSubSubscription,
   getAppAccessToken,
   getBroadcasterId,
   getBroadcasterUser,
+  getLastAuthorizedUser,
   getLiveStreamGame,
   getUserAccessToken
 } from './twitch.js';
@@ -39,6 +41,18 @@ function text(res: http.ServerResponse, code: number, body: string) {
   res.end(body);
 }
 
+function requireAdmin(env: ReturnType<typeof getEnv>, req: http.IncomingMessage): boolean {
+  const key = env.ADMIN_API_KEY;
+  if (!key) return true; // not configured -> allow (dev)
+  const provided = (req.headers['x-admin-key'] ?? '').toString();
+  return provided === key;
+}
+
+function getRedirectUri(env: ReturnType<typeof getEnv>): string {
+  // Allow explicit override to avoid redirect_mismatch issues across environments
+  return env.TWITCH_REDIRECT_URI ?? `${env.PUBLIC_BASE_URL.replace(/\/$/, '')}/oauth/callback`;
+}
+
 async function main() {
   const env = getEnv();
   const pool = createPool();
@@ -66,7 +80,7 @@ async function main() {
       if (url.pathname === '/oauth/start') {
         // Broadcaster authorization for channel.update (category changes)
         // Scope chosen to allow reading updates via EventSub for channel metadata changes.
-        const redirectUri = `${env.PUBLIC_BASE_URL.replace(/\/$/, '')}/oauth/callback`;
+        const redirectUri = getRedirectUri(env);
         const authorize = new URL('https://id.twitch.tv/oauth2/authorize');
         authorize.searchParams.set('client_id', env.TWITCH_CLIENT_ID);
         authorize.searchParams.set('redirect_uri', redirectUri);
@@ -83,7 +97,7 @@ async function main() {
         const state = url.searchParams.get('state');
         if (!code || !state || state !== oauthState) return text(res, 400, 'Invalid OAuth state');
 
-        const redirectUri = `${env.PUBLIC_BASE_URL.replace(/\/$/, '')}/oauth/callback`;
+        const redirectUri = getRedirectUri(env);
         const tokenResp = await fetch('https://id.twitch.tv/oauth2/token', {
           method: 'POST',
           headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -116,6 +130,10 @@ async function main() {
         const expiresAt = new Date(Date.now() + (tokenJson.expires_in ?? 3600) * 1000);
         const scope = Array.isArray(tokenJson.scope) ? tokenJson.scope.join(' ') : String(tokenJson.scope ?? '');
 
+        const encKey = env.TOKEN_ENCRYPTION_KEY;
+        const accessToken = encryptIfConfigured(String(tokenJson.access_token), encKey);
+        const refreshToken = encryptIfConfigured(String(tokenJson.refresh_token), encKey);
+
         await pool.query(
           `
           INSERT INTO oauth_tokens(provider, subject, access_token, refresh_token, scope, expires_at)
@@ -127,7 +145,7 @@ async function main() {
             expires_at = EXCLUDED.expires_at,
             updated_at = NOW()
           `,
-          ['twitch', subject, tokenJson.access_token, tokenJson.refresh_token, scope, expiresAt]
+          ['twitch', subject, accessToken, refreshToken, scope, expiresAt]
         );
 
         return text(res, 200, 'OAuth complete. You can close this window.');
@@ -140,6 +158,27 @@ async function main() {
           ok: true,
           broadcaster: { login: env.TWITCH_BROADCASTER_LOGIN, id: broadcasterId },
           activeStream: active
+        });
+      }
+
+      if (url.pathname === '/oauth/whoami') {
+        if (!requireAdmin(env, req)) return json(res, 403, { ok: false, error: 'Forbidden' });
+        const who = await getLastAuthorizedUser(pool, env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
+        return json(res, 200, {
+          ok: true,
+          authorizedUser: who,
+          note: 'No tokens are returned by this endpoint.'
+        });
+      }
+
+      if (url.pathname === '/debug/oauth') {
+        if (!requireAdmin(env, req)) return json(res, 403, { ok: false, error: 'Forbidden' });
+        return json(res, 200, {
+          ok: true,
+          twitchClientId: env.TWITCH_CLIENT_ID,
+          publicBaseUrl: env.PUBLIC_BASE_URL,
+          effectiveRedirectUri: getRedirectUri(env),
+          note: 'Register effectiveRedirectUri exactly in the Twitch Developer Console.'
         });
       }
 
