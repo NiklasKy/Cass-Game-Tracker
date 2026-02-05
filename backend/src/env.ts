@@ -40,7 +40,10 @@ export function getEnv(): Env {
   const cleaned: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== 'string') continue;
-    cleaned[k] = stripWrappingQuotes(v);
+    const stripped = stripWrappingQuotes(v);
+    // Treat empty strings as "unset" so optional vars from docker-compose (VAR:-) don't fail validation.
+    if (stripped.trim() === '') continue;
+    cleaned[k] = stripped;
   }
   return EnvSchema.parse(cleaned);
 }
