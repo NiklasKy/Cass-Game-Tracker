@@ -55,8 +55,8 @@ Complete authorization. The collector stores the broadcaster token in Postgres.
 
 Notes:
 
-- The collector can still track `stream.online` / `stream.offline` without OAuth.
-- OAuth is required to subscribe to `channel.update` (category changes) reliably.
+- With EventSub WebSocket transport, subscription creation requires a **user access token**.
+  Run OAuth once via `/oauth/start` so the collector can subscribe to `stream.online`, `stream.offline`, and `channel.update`.
 
 ## 7) Verify
 

@@ -230,19 +230,14 @@ async function ensureSubscriptions(
   sessionId: string,
   broadcasterId: string
 ) {
-  const appToken = await getAppAccessToken(env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
+  // Important: EventSub WebSocket transport requires a USER access token for subscription creation,
+  // even for public topics like stream.online/offline.
+  // Reference: https://discuss.dev.twitch.com/t/invalid-transport-and-auth-combination-error/59864
+  const userToken = await getUserAccessToken(pool, env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
 
-  // stream.online/offline usually work with app token
-  await safeCreateSub(env, appToken, 'stream.online', '1', { broadcaster_user_id: broadcasterId }, sessionId);
-  await safeCreateSub(env, appToken, 'stream.offline', '1', { broadcaster_user_id: broadcasterId }, sessionId);
-
-  // channel.update requires broadcaster user token (OAuth done via /oauth/start)
-  try {
-    const userToken = await getUserAccessToken(pool, env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
-    await safeCreateSub(env, userToken, 'channel.update', '2', { broadcaster_user_id: broadcasterId }, sessionId);
-  } catch (e: any) {
-    console.warn('[eventsub] channel.update not subscribed yet (OAuth missing?)', e?.message ?? String(e));
-  }
+  await safeCreateSub(env, userToken, 'stream.online', '1', { broadcaster_user_id: broadcasterId }, sessionId);
+  await safeCreateSub(env, userToken, 'stream.offline', '1', { broadcaster_user_id: broadcasterId }, sessionId);
+  await safeCreateSub(env, userToken, 'channel.update', '2', { broadcaster_user_id: broadcasterId }, sessionId);
 }
 
 async function safeCreateSub(
