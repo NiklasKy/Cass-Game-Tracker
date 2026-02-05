@@ -1,0 +1,51 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cass_tracker}
+      POSTGRES_USER: ${POSTGRES_USER:-cass}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cass}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cass} -d ${POSTGRES_DB:-cass_tracker}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  collector:
+    container_name: cass-collector
+    build:
+      context: ./backend
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL:-postgresql://cass:cass@db:5432/cass_tracker}
+
+      # Twitch
+      TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID}
+      TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET}
+      TWITCH_BROADCASTER_LOGIN: ${TWITCH_BROADCASTER_LOGIN:-cassia_quing}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+
+      # Google Sheets
+      GOOGLE_SHEET_ID: ${GOOGLE_SHEET_ID}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${GOOGLE_SERVICE_ACCOUNT_JSON}
+      GOOGLE_SHEET_TAB_NAME: Games
+    depends_on:
+      db:
+        condition: service_healthy
+    # Expose is optional; the edge proxy reaches this container via the shared Docker network.
+    expose:
+      - "8080"
+    networks:
+      - default
+      - edge-proxy
+    restart: unless-stopped
+
+volumes:
+  db_data:
+
+networks:
+  edge-proxy:
+    external: true
+
