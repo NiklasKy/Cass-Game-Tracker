@@ -30,6 +30,19 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+function log(...args: any[]) {
+  // eslint-disable-next-line no-console
+  console.log(`[${nowIso()}]`, ...args);
+}
+function warn(...args: any[]) {
+  // eslint-disable-next-line no-console
+  console.warn(`[${nowIso()}]`, ...args);
+}
+function err(...args: any[]) {
+  // eslint-disable-next-line no-console
+  console.error(`[${nowIso()}]`, ...args);
+}
+
 function json(res: http.ServerResponse, code: number, body: unknown) {
   res.statusCode = code;
   res.setHeader('content-type', 'application/json; charset=utf-8');
@@ -77,8 +90,13 @@ async function main() {
   const appToken = await getAppAccessToken(env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
   const broadcaster = await getBroadcasterUser(pool, env.TWITCH_CLIENT_ID, appToken, env.TWITCH_BROADCASTER_LOGIN);
 
-  // Bootstrap: if we start while the stream is already live, create the stream + initial segment.
-  await bootstrapIfLive(pool, env, broadcaster.id, broadcaster.login);
+  // Recovery/bootstrap: ensure DB state matches current live state.
+  await reconcileStreamState(pool, env, broadcaster.id, broadcaster.login);
+  setInterval(() => {
+    void reconcileStreamState(pool, env, broadcaster.id, broadcaster.login).catch((e) =>
+      warn('[reconcile] failed', e?.message ?? String(e))
+    );
+  }, 5 * 60 * 1000);
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -208,8 +226,8 @@ async function main() {
   });
 
   server.listen(8080, () => {
-    console.log(`[collector] listening on :8080`);
-    console.log(`[collector] oauth: ${env.PUBLIC_BASE_URL.replace(/\/$/, '')}/oauth/start`);
+    log('[collector] listening on :8080');
+    log('[collector] oauth:', `${env.PUBLIC_BASE_URL.replace(/\/$/, '')}/oauth/start`);
   });
 
   connectEventSub({
@@ -217,10 +235,11 @@ async function main() {
     env,
     broadcasterId: broadcaster.id,
     broadcasterLogin: broadcaster.login
-  }).catch((e) => console.error('[eventsub] fatal', e));
+  }).catch((e) => err('[eventsub] fatal', e));
 }
 
 main().catch((err) => {
+  // eslint-disable-next-line no-console
   console.error(err);
   process.exit(1);
 });
@@ -233,53 +252,101 @@ async function connectEventSub(opts: {
 }) {
   const { pool, env, broadcasterId, broadcasterLogin } = opts;
 
-  let ws = new WebSocket('wss://eventsub.wss.twitch.tv/ws');
+  const defaultWsUrl = 'wss://eventsub.wss.twitch.tv/ws';
+  let active: WebSocket | null = null;
+  let draining: WebSocket[] = [];
+  let reconnectAttempts = 0;
+  let reconnectTimer: NodeJS.Timeout | null = null;
 
-  const openWs = (socket: WebSocket) => {
-    socket.on('open', () => console.log('[eventsub] ws open'));
-    socket.on('close', () => console.log('[eventsub] ws close'));
-    socket.on('error', (err) => console.error('[eventsub] ws error', err));
-    socket.on('message', async (data) => {
-      const msg = JSON.parse(data.toString());
-      const msgType = msg?.metadata?.message_type ?? 'unknown';
-      await pool.query(`INSERT INTO events_raw(source, event_type, payload) VALUES ($1,$2,$3)`, [
-        'eventsub_ws',
-        msgType,
-        msg
-      ]);
+  function clearReconnectTimer() {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
 
-      if (msgType === 'session_welcome') {
-        const sessionId = msg?.payload?.session?.id;
-        if (!sessionId) throw new Error('Missing session id in welcome');
-        console.log('[eventsub] session', sessionId);
-        try {
-          await ensureSubscriptions(pool, env, sessionId, broadcasterId);
-        } catch (e: any) {
-          console.warn('[eventsub] subscription setup warning', e?.message ?? String(e));
-        }
-        return;
-      }
+  function scheduleReconnect() {
+    clearReconnectTimer();
+    reconnectAttempts += 1;
+    const backoffMs = Math.min(30_000, 1000 * Math.pow(2, Math.min(5, reconnectAttempts - 1)));
+    warn('[eventsub] scheduling reconnect in', backoffMs, 'ms');
+    reconnectTimer = setTimeout(() => startSocket(defaultWsUrl), backoffMs);
+  }
 
-      if (msgType === 'session_reconnect') {
-        const reconnectUrl = msg?.payload?.session?.reconnect_url;
-        if (reconnectUrl) {
-          console.log('[eventsub] reconnecting');
-          try {
-            socket.close();
-          } catch {}
-          ws = new WebSocket(reconnectUrl);
-          openWs(ws);
-        }
-        return;
-      }
+  function startSocket(url: string) {
+    clearReconnectTimer();
+    const socket = new WebSocket(url);
+    const isDefault = url === defaultWsUrl;
+    if (active) draining.push(active);
+    active = socket;
 
-      if (msgType === 'notification') {
-        await handleNotification(pool, env, broadcasterId, broadcasterLogin, msg);
+    socket.on('open', () => log('[eventsub] ws open', isDefault ? '' : '(reconnect_url)'));
+
+    socket.on('close', (code, reason) => {
+      const reasonStr = reason ? reason.toString() : '';
+      log('[eventsub] ws close', { code, reason: reasonStr });
+
+      // If the active socket closes unexpectedly, reconnect.
+      if (socket === active) {
+        active = null;
+        scheduleReconnect();
       }
     });
-  };
 
-  openWs(ws);
+    socket.on('error', (e) => err('[eventsub] ws error', e));
+
+    socket.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        const msgType = msg?.metadata?.message_type ?? 'unknown';
+        await pool.query(`INSERT INTO events_raw(source, event_type, payload) VALUES ($1,$2,$3)`, [
+          'eventsub_ws',
+          msgType,
+          msg
+        ]);
+
+        if (msgType === 'session_welcome') {
+          const sessionId = msg?.payload?.session?.id;
+          if (!sessionId) throw new Error('Missing session id in welcome');
+          log('[eventsub] session', sessionId);
+
+          // Successful welcome: reset reconnect backoff and close any draining sockets.
+          reconnectAttempts = 0;
+          clearReconnectTimer();
+          draining.forEach((s) => {
+            try {
+              s.close();
+            } catch {}
+          });
+          draining = [];
+
+          try {
+            await ensureSubscriptions(pool, env, sessionId, broadcasterId);
+          } catch (e: any) {
+            warn('[eventsub] subscription setup warning', e?.message ?? String(e));
+          }
+          return;
+        }
+
+        if (msgType === 'session_reconnect') {
+          const reconnectUrl = msg?.payload?.session?.reconnect_url;
+          if (reconnectUrl) {
+            // Per Twitch docs, do NOT close the current connection immediately.
+            // Connect to reconnect_url; Twitch will close the old socket after the new one is established.
+            log('[eventsub] reconnecting');
+            startSocket(reconnectUrl);
+          }
+          return;
+        }
+
+        if (msgType === 'notification') {
+          await handleNotification(pool, env, broadcasterId, broadcasterLogin, msg);
+        }
+      } catch (e: any) {
+        err('[eventsub] message handler error', e?.message ?? String(e));
+      }
+    });
+  }
+
+  startSocket(defaultWsUrl);
 }
 
 async function ensureSubscriptions(
@@ -308,15 +375,15 @@ async function safeCreateSub(
 ) {
   try {
     await createEventSubSubscription(env.TWITCH_CLIENT_ID, token, type, version, condition, sessionId);
-    console.log('[eventsub] subscribed', type);
+    log('[eventsub] subscribed', type);
   } catch (e: any) {
     const msg = e?.message ?? String(e);
     // If the sub already exists, Helix may return 409. We treat it as OK.
     if (/409/.test(msg) || /Conflict/i.test(msg)) {
-      console.log('[eventsub] subscription exists', type);
+      log('[eventsub] subscription exists', type);
       return;
     }
-    console.warn('[eventsub] subscribe failed', type, msg);
+    warn('[eventsub] subscribe failed', type, msg);
   }
 }
 
@@ -339,7 +406,7 @@ async function handleNotification(
     const appToken = await getAppAccessToken(env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
     const game = await getLiveStreamGame(env.TWITCH_CLIENT_ID, appToken, broadcasterId);
     await startSegment(pool, streamId, game.categoryId, game.categoryName, ts);
-    console.log('[segments] stream online', streamId, game.categoryName);
+    log('[segments] stream online', streamId, game.categoryName);
     return;
   }
 
@@ -350,7 +417,7 @@ async function handleNotification(
     const categoryId = event?.category_id ? String(event.category_id) : null;
     const categoryName = event?.category_name ? String(event.category_name) : 'Unknown';
     await rotateSegment(pool, streamId, categoryId, categoryName, ts);
-    console.log('[segments] rotate', streamId, categoryName);
+    log('[segments] rotate', streamId, categoryName);
     return;
   }
 
@@ -361,23 +428,22 @@ async function handleNotification(
 
     await closeOpenSegment(pool, streamId, ts);
     await markStreamOffline(pool, streamId, ts, 'offline_event');
-    console.log('[segments] stream offline', streamId);
+    log('[segments] stream offline', streamId);
 
     // Write global totals: baseline + all collected segments
     await exportTotalsToSheet(pool, env);
-    console.log('[sheets] updated from stream', streamId);
+    log('[sheets] updated from stream', streamId);
     return;
   }
 }
 
-async function bootstrapIfLive(
+async function reconcileStreamState(
   pool: ReturnType<typeof createPool>,
   env: ReturnType<typeof getEnv>,
   broadcasterId: string,
   broadcasterLogin: string
 ) {
   const active = await getActiveStream(pool, broadcasterId);
-  if (active) return;
 
   const appToken = await getAppAccessToken(env.TWITCH_CLIENT_ID, env.TWITCH_CLIENT_SECRET);
   // If live, Helix streams response includes `id` and `started_at` and game fields.
@@ -385,15 +451,28 @@ async function bootstrapIfLive(
     headers: { Authorization: `Bearer ${appToken}`, 'Client-Id': env.TWITCH_CLIENT_ID }
   })).json();
   const stream = resp?.data?.[0];
-  if (!stream) return;
+  const isLive = !!stream;
 
-  const streamId = String(stream.id ?? `bootstrap_${Date.now()}`);
-  const startedAt = stream.started_at ? new Date(stream.started_at) : new Date();
-  const categoryId = stream.game_id ? String(stream.game_id) : null;
-  const categoryName = stream.game_name ? String(stream.game_name) : 'Unknown';
+  if (isLive && !active) {
+    const streamId = String(stream.id ?? `bootstrap_${Date.now()}`);
+    const startedAt = stream.started_at ? new Date(stream.started_at) : new Date();
+    const categoryId = stream.game_id ? String(stream.game_id) : null;
+    const categoryName = stream.game_name ? String(stream.game_name) : 'Unknown';
 
-  await upsertStreamOnline(pool, streamId, broadcasterId, broadcasterLogin, startedAt);
-  await startSegment(pool, streamId, categoryId, categoryName, startedAt);
-  console.log('[bootstrap] live stream detected', streamId, categoryName);
+    await upsertStreamOnline(pool, streamId, broadcasterId, broadcasterLogin, startedAt);
+    await startSegment(pool, streamId, categoryId, categoryName, startedAt);
+    log('[bootstrap] live stream detected', streamId, categoryName);
+    return;
+  }
+
+  if (!isLive && active) {
+    // We missed the offline event (collector was down). Finalize now.
+    const ts = new Date();
+    await closeOpenSegment(pool, active.streamId, ts);
+    await markStreamOffline(pool, active.streamId, ts, 'recovered_offline');
+    log('[reconcile] recovered offline stream', active.streamId);
+    await exportTotalsToSheet(pool, env);
+    log('[sheets] updated from recovered offline', active.streamId);
+  }
 }
 
